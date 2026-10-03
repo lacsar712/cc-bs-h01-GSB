@@ -1,4 +1,10 @@
-"""后台工人：用 SKIP LOCKED 认领 pending 应变读数并写入合格/越界结论。"""
+"""后台工人：用 SKIP LOCKED 认领 pending 应变读数并写入合格/越界结论。
+
+认领（行锁）与写结论在**同一个事务**内完成：
+- 成功才提交；
+- 任何异常整体回滚，行保持 pending 可被再次认领，
+  不会留下卡在 processing 或只写了一半 verdict/reason 的脏行。
+"""
 
 import os
 import time
@@ -9,7 +15,12 @@ from rules import judge_microstrain
 POLL_SECONDS = float(os.environ.get("WORKER_POLL_SECONDS", "1.0"))
 
 
-def claim_one(conn):
+def process_one(conn) -> bool:
+    """认领一条 pending 读数并在同一事务里写入最终结论。
+
+    返回 True 表示处理并提交了一条；False 表示当前没有待处理读数。
+    若判定或写库抛错，事务整体回滚，调用方会看到异常，行仍为 pending。
+    """
     with conn.transaction():
         row = conn.execute(
             """
@@ -21,44 +32,27 @@ def claim_one(conn):
             LIMIT 1
             """
         ).fetchone()
-        if not row:
-            return None
+        if row is None:
+            return False
+
+        verdict, reason = judge_microstrain(float(row["microstrain"]))
         conn.execute(
-            "UPDATE strain_readings SET status = 'processing' WHERE id = %s",
-            (row["id"],),
+            """
+            UPDATE strain_readings
+            SET status = 'done',
+                verdict = %s,
+                reason = %s,
+                processed_at = now()
+            WHERE id = %s
+            """,
+            (verdict, reason, row["id"]),
         )
-        return row
-
-
-def finish(conn, reading_id: int, microstrain: float) -> None:
-    from h01_extra_trap import on_worker_save
-    verdict, reason = judge_microstrain(microstrain)
-    verdict, reason = on_worker_save(verdict, reason)
-    conn.execute(
-        """
-        UPDATE strain_readings
-        SET status = 'done', verdict = %s, reason = %s, processed_at = now()
-        WHERE id = %s
-        """,
-        (verdict, reason, reading_id),
-    )
-    conn.commit()
+        return True
 
 
 def run_once(conn) -> bool:
-    row = claim_one(conn)
-    if not row:
-        return False
-    try:
-        finish(conn, row["id"], float(row["microstrain"]))
-    except Exception:
-        conn.execute(
-            "UPDATE strain_readings SET status = 'pending' WHERE id = %s",
-            (row["id"],),
-        )
-        conn.commit()
-        raise
-    return True
+    # 单事务：异常时 with conn.transaction() 已整体回滚，行保持 pending。
+    return process_one(conn)
 
 
 def main() -> None:

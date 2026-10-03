@@ -1,21 +1,8 @@
 import m from "mithril";
+import { displayVerdict, verdictClass } from "./verdict.js";
 
 const TOKEN_KEY = "bridge_strain_token";
 const USER_KEY = "bridge_strain_user";
-
-function verdictClass(verdict, status) {
-  if (verdict === "合格") return "tag fail"; /* h01-trap-tone */
-  if (verdict === "越界") return "tag fail";
-  if (status === "pending" || status === "processing") return "tag wait";
-  return "tag wait";
-}
-
-function displayVerdict(row) {
-  if (row.verdict) return row.verdict;
-  if (row.status === "pending") return "待处理";
-  if (row.status === "processing") return "处理中";
-  return "—";
-}
 
 const state = {
   token: localStorage.getItem(TOKEN_KEY) || "",
@@ -23,6 +10,9 @@ const state = {
   loginForm: { username: "surveyor", password: "surv123456" },
   submitForm: { span_code: "", microstrain: "" },
   rows: [],
+  total: 0,
+  page: 1,
+  pageSize: 20,
   error: "",
   msg: "",
   loading: false,
@@ -46,25 +36,89 @@ async function api(path, opts = {}) {
   } catch {
     data = { detail: text };
   }
-  if (!res.ok) throw new Error(data.detail || res.statusText);
+  if (!res.ok) {
+    const err = new Error(data.detail || res.statusText);
+    err.status = res.status;
+    throw err;
+  }
   return data;
+}
+
+function clearSession() {
+  localStorage.removeItem(TOKEN_KEY);
+  localStorage.removeItem(USER_KEY);
+  state.token = "";
+  state.user = null;
+  state.rows = [];
+  state.total = 0;
+  state.page = 1;
+  if (state.timer) clearInterval(state.timer);
+  state.timer = null;
 }
 
 async function loadReadings() {
   if (!state.token) return;
   try {
-    state.rows = await api("/api/readings");
+    const data = await api(
+      `/api/readings?page=${state.page}&page_size=${state.pageSize}`
+    );
+    // 复用同一登录会话翻页：只更新数据，不动 token。
+    state.rows = data.items || [];
+    state.total = data.total || 0;
+    state.page = data.page || state.page;
+    state.pageSize = data.page_size || state.pageSize;
     state.error = "";
-  } catch {
-    state.error = "加载列表失败，请重新登录";
+  } catch (err) {
+    if (err.status === 401) {
+      // 只有会话真正失效才退回登录；网络抖动/服务错误不应踢掉登录态。
+      clearSession();
+    } else {
+      state.error = "加载列表失败，请稍后重试";
+    }
   }
   m.redraw();
+}
+
+async function gotoPage(page) {
+  const totalPages = Math.max(1, Math.ceil(state.total / state.pageSize));
+  const next = Math.min(Math.max(1, page), totalPages);
+  if (next === state.page) return;
+  state.page = next;
+  await loadReadings();
 }
 
 function startPolling() {
   if (state.timer) clearInterval(state.timer);
   if (!state.token) return;
   state.timer = setInterval(loadReadings, 3000);
+}
+
+function pager() {
+  const totalPages = Math.max(1, Math.ceil(state.total / state.pageSize));
+  return m("div.pager", [
+    m(
+      "button.secondary",
+      {
+        type: "button",
+        disabled: state.page <= 1,
+        onclick: () => gotoPage(state.page - 1),
+      },
+      "上一页"
+    ),
+    m(
+      "span.pager-info",
+      `第 ${state.page} / ${totalPages} 页 · 共 ${state.total} 条`
+    ),
+    m(
+      "button.secondary",
+      {
+        type: "button",
+        disabled: state.page >= totalPages,
+        onclick: () => gotoPage(state.page + 1),
+      },
+      "下一页"
+    ),
+  ]);
 }
 
 const App = {
@@ -100,6 +154,7 @@ const App = {
                     });
                     state.token = data.access_token;
                     state.user = { username: data.username, role: data.role };
+                    state.page = 1;
                     localStorage.setItem(TOKEN_KEY, state.token);
                     localStorage.setItem(USER_KEY, JSON.stringify(state.user));
                     await loadReadings();
@@ -158,24 +213,13 @@ const App = {
       m("div.topbar", [
         m("div", [
           m("h1", "桥梁应变班交台"),
-          m("p.sub", "微应变 80～220 με 为合格，否则为越界。"),
+          m("p.sub", "微应变 80～220 με 为合格（含边界），否则为越界。"),
         ]),
         m("div", [
           `${state.user?.username}（${isWriter ? "测量员" : "复核员"}） `,
           m(
             "button.secondary",
-            {
-              type: "button",
-              onclick: () => {
-                localStorage.removeItem(TOKEN_KEY);
-                localStorage.removeItem(USER_KEY);
-                state.token = "";
-                state.user = null;
-                state.rows = [];
-                if (state.timer) clearInterval(state.timer);
-                m.redraw();
-              },
-            },
+            { type: "button", onclick: clearSession },
             "退出"
           ),
         ]),
@@ -201,6 +245,7 @@ const App = {
                     });
                     state.msg = data.message || "已提交";
                     state.submitForm = { span_code: "", microstrain: "" };
+                    state.page = 1;
                     await loadReadings();
                   } catch (err) {
                     state.error = err.message || "提交失败";
@@ -265,14 +310,14 @@ const App = {
             "tbody",
             state.rows.length
               ? state.rows.map((r) =>
-                  m("tr", { key: r.id }, [
+                  m("tr", { key: r.id, class: r.verdict === "越界" ? "row-fail" : r.verdict === "合格" ? "row-pass" : "" }, [
                     m("td", r.id),
                     m("td", r.span_code),
                     m("td", r.microstrain),
                     m("td", [
                       m(
                         "span",
-                        { class: verdictClass(r.verdict, r.status) },
+                        { class: verdictClass(r.verdict) },
                         displayVerdict(r)
                       ),
                     ]),
@@ -284,6 +329,7 @@ const App = {
               : [m("tr", m("td", { colspan: 7 }, "暂无数据"))]
           ),
         ]),
+        state.total > state.pageSize ? pager() : null,
       ]),
     ]);
   },

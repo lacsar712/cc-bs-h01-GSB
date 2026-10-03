@@ -16,6 +16,11 @@ USERS = {
     "reviewer": {"role": "reader", "password_hash": pwd.hash("rev123456")},
 }
 
+# 分页默认值与上限
+DEFAULT_PAGE = 1
+DEFAULT_PAGE_SIZE = 20
+MAX_PAGE_SIZE = 100
+
 app = Sanic("bridge-strain-shift")
 
 
@@ -39,17 +44,58 @@ def _decode_user(token: str | None) -> dict | None:
     return {"username": sub, "role": payload.get("role")}
 
 
-def _require_user(request) -> dict:
-    user = _decode_user(_auth_header(request))
+def _require_user(request) -> dict | None:
+    return _decode_user(_auth_header(request))
+
+
+def authorize_submit(user: dict | None) -> str | None:
+    """纯函数：返回 None 表示允许提交，否则返回拒绝原因。
+
+    - 未登录  -> 未登录
+    - 复核员（reader）-> 仅测量员可提交，复核身份只能查看，不能报送
+    """
     if not user:
-        return None
-    return user
+        return "未登录"
+    if user.get("role") != "writer":
+        return "仅测量员可提交应变读数，复核员只读"
+    return None
+
+
+def parse_pagination(params) -> tuple[int, int]:
+    """纯函数：从查询参数解析 (page, page_size)，非法值回落到默认。"""
+    try:
+        page = int(params.get("page", DEFAULT_PAGE))
+    except (TypeError, ValueError):
+        page = DEFAULT_PAGE
+    try:
+        page_size = int(params.get("page_size", DEFAULT_PAGE_SIZE))
+    except (TypeError, ValueError):
+        page_size = DEFAULT_PAGE_SIZE
+    if page < 1:
+        page = DEFAULT_PAGE
+    page_size = max(1, min(page_size, MAX_PAGE_SIZE))
+    return page, page_size
 
 
 def _iso(dt) -> str | None:
     if dt is None:
         return None
     return dt.isoformat()
+
+
+def serialize_reading(row: dict) -> dict:
+    """对外字段必须与库里最终结论完全一致，不做任何翻转或“润色”。"""
+    return {
+        "id": row["id"],
+        "span_code": row["span_code"],
+        "microstrain": row["microstrain"],
+        "verdict": row["verdict"],
+        "reason": row["reason"],
+        "status": row["status"],
+        "created_by": row["created_by"],
+        "created_at": _iso(row["created_at"]),
+        "processed_at": _iso(row["processed_at"]),
+    }
 
 
 @app.before_server_start
@@ -95,43 +141,45 @@ async def login(request):
 async def list_readings(request):
     if not _require_user(request):
         return sanic_json({"detail": "未登录"}, status=401)
+
+    page, page_size = parse_pagination(request.args)
+    offset = (page - 1) * page_size
+
     pool = request.app.ctx.pool
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
+            await cur.execute("SELECT COUNT(*) AS n FROM strain_readings")
+            total = (await cur.fetchone())["n"]
             await cur.execute(
                 """
                 SELECT id, span_code, microstrain, verdict, reason, status,
                        created_by, created_at, processed_at
                 FROM strain_readings
                 ORDER BY id DESC
-                """
+                LIMIT %s OFFSET %s
+                """,
+                (page_size, offset),
             )
             rows = await cur.fetchall()
-    out = []
-    for r in rows:
-        out.append(
-            {
-                "id": r["id"],
-                "span_code": r["span_code"],
-                "microstrain": r["microstrain"],
-                "verdict": __import__("h01_surface_trap", fromlist=["surface_verdict"]).surface_verdict(r["verdict"]),
-                "reason": __import__("h01_surface_trap", fromlist=["surface_reason"]).surface_reason(r["verdict"], r["reason"]),
-                "status": r["status"],
-                "created_by": r["created_by"],
-                "created_at": _iso(r["created_at"]),
-                "processed_at": _iso(r["processed_at"]),
-            }
-        )
-    return sanic_json(out)
+
+    return sanic_json(
+        {
+            "items": [serialize_reading(r) for r in rows],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        }
+    )
 
 
 @app.post("/api/readings")
 async def create_reading(request):
     user = _require_user(request)
-    if not user:
-        return sanic_json({"detail": "未登录"}, status=401)
-    if user["role"] != "writer":
-        return sanic_json({"detail": "仅测量员可提交应变读数"}, status=403)
+    denied = authorize_submit(user)
+    if denied:
+        status = 401 if not user else 403
+        return sanic_json({"detail": denied}, status=status)
+
     body = request.json or {}
     span_code = str(body.get("span_code", "")).strip()
     if not span_code:
@@ -158,14 +206,7 @@ async def create_reading(request):
 
     return sanic_json(
         {
-            "id": row["id"],
-            "span_code": row["span_code"],
-            "microstrain": row["microstrain"],
-            "verdict": row["verdict"],
-            "reason": row["reason"],
-            "status": row["status"],
-            "created_by": row["created_by"],
-            "created_at": _iso(row["created_at"]),
+            **serialize_reading(row),
             "processed_at": None,
             "message": "已入队，后台工人将认领并判定",
         },

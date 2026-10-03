@@ -108,6 +108,27 @@ th {
   background: #eceff1;
 }
 
+/* 整行色调必须与库里最终结论同一意思：合格淡绿、越界淡红。 */
+tr.row-pass td {
+  background: #f3faf3;
+}
+
+tr.row-fail td {
+  background: #fdf3f4;
+}
+
+.pager {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 0.75rem;
+}
+
+.pager-info {
+  font-size: 0.85rem;
+  color: #555;
+}
+
 .tag {
   display: inline-block;
   padding: 0.15rem 0.45rem;
