@@ -9,7 +9,12 @@ from rules import judge_microstrain
 POLL_SECONDS = float(os.environ.get("WORKER_POLL_SECONDS", "1.0"))
 
 
-def claim_one(conn):
+def process_one(conn) -> bool:
+    """认领一条待处理读数，并在同一事务内写入最终结论。
+
+    认领、判定、落库在同一个事务中完成：任一步失败都会整体回滚，
+    行保持 pending 等待下轮重试，不会留下改了一半的脏行。
+    """
     with conn.transaction():
         row = conn.execute(
             """
@@ -22,42 +27,16 @@ def claim_one(conn):
             """
         ).fetchone()
         if not row:
-            return None
+            return False
+        verdict, reason = judge_microstrain(float(row["microstrain"]))
         conn.execute(
-            "UPDATE strain_readings SET status = 'processing' WHERE id = %s",
-            (row["id"],),
+            """
+            UPDATE strain_readings
+            SET status = 'done', verdict = %s, reason = %s, processed_at = now()
+            WHERE id = %s
+            """,
+            (verdict, reason, row["id"]),
         )
-        return row
-
-
-def finish(conn, reading_id: int, microstrain: float) -> None:
-    from h01_extra_trap import on_worker_save
-    verdict, reason = judge_microstrain(microstrain)
-    verdict, reason = on_worker_save(verdict, reason)
-    conn.execute(
-        """
-        UPDATE strain_readings
-        SET status = 'done', verdict = %s, reason = %s, processed_at = now()
-        WHERE id = %s
-        """,
-        (verdict, reason, reading_id),
-    )
-    conn.commit()
-
-
-def run_once(conn) -> bool:
-    row = claim_one(conn)
-    if not row:
-        return False
-    try:
-        finish(conn, row["id"], float(row["microstrain"]))
-    except Exception:
-        conn.execute(
-            "UPDATE strain_readings SET status = 'pending' WHERE id = %s",
-            (row["id"],),
-        )
-        conn.commit()
-        raise
     return True
 
 
@@ -70,7 +49,7 @@ def main() -> None:
     while True:
         try:
             with connect_sync() as conn:
-                processed = run_once(conn)
+                processed = process_one(conn)
         except Exception as exc:
             print(f"worker error: {exc}", flush=True)
             processed = False

@@ -4,7 +4,7 @@ const TOKEN_KEY = "bridge_strain_token";
 const USER_KEY = "bridge_strain_user";
 
 function verdictClass(verdict, status) {
-  if (verdict === "合格") return "tag fail"; /* h01-trap-tone */
+  if (verdict === "合格") return "tag pass";
   if (verdict === "越界") return "tag fail";
   if (status === "pending" || status === "processing") return "tag wait";
   return "tag wait";
